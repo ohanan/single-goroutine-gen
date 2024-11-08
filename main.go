@@ -22,13 +22,18 @@ var tmpl string
 func main() {
 	var serviceName string
 	var target string
+	var imports string
 	flag.StringVar(&serviceName, "service", "", "service name")
 	flag.StringVar(&target, "target", "", "target")
+	flag.StringVar(&imports, "imports", "", "imports")
 	flag.Parse()
 	if serviceName == "" {
 		panic("service name is empty")
 	}
 	data := getData(serviceName)
+	if imports != "" {
+		data.Imports = strings.Split(imports, ",")
+	}
 	if data == nil {
 		panic("service not found")
 	}
@@ -67,7 +72,7 @@ func main() {
 		source = removeEmptyLine.Bytes()
 	}
 	if target == "" {
-		target = data.file + "_gen"
+		target = serviceName + "_gen.go"
 	}
 	err = os.WriteFile(target, source, 0644)
 	if err != nil {
@@ -76,10 +81,13 @@ func main() {
 }
 
 type Data struct {
-	file    string
-	Package string
-	Service string
-	Methods []*Method
+	Package        string
+	Service        string
+	Client         string
+	ServiceMethods []*Method
+	ClientMethods  []*Method
+	ClientID       string
+	Imports        []string
 }
 
 func getData(serviceName string) *Data {
@@ -89,6 +97,62 @@ func getData(serviceName string) *Data {
 	if err != nil {
 		panic(err)
 	}
+	pkgName, serviceMethods := getMethods(packages, serviceName)
+	var containsClose bool
+	var clientIDType, removedClientIDType, clientType string
+	for _, method := range serviceMethods {
+		switch method.Name {
+		case "AddClient":
+			if len(method.Param) != 2 {
+				panic("should have 2 params for AddClient(id ID_TYPE, client CLIENT_TYPE)")
+			}
+			if len(method.Result) != 0 {
+				panic("should not have result for AddClient(id ID_TYPE, client CLIENT_TYPE)")
+			}
+			clientIDType = method.Param[0]
+			clientType = method.Param[1]
+		case "RemoveClient":
+			if len(method.Param) != 1 {
+				panic("should have 1 params for RemoveClient(id ID_TYPE)")
+			}
+			if len(method.Result) != 0 {
+				panic("should not have result for RemoveClient(id ID_TYPE)")
+			}
+			removedClientIDType = method.Param[0]
+		case "Close":
+			if len(method.Param) != 0 {
+				panic("should not have params for Close()")
+			}
+			if len(method.Result) != 0 {
+				panic("should not have result for Close()")
+			}
+			containsClose = true
+		}
+	}
+	if !containsClose {
+		panic("service should have Close() method")
+	}
+	if clientIDType != removedClientIDType {
+		panic("AddClient(id ID_TYPE, client CLIENT_TYPE) and RemoveClient(id ID_TYPE) should have the same ID_TYPE type")
+	}
+	var clientMethods []*Method
+	if clientIDType != "" {
+		var clientPkgName string
+		clientPkgName, clientMethods = getMethods(packages, clientType)
+		if pkgName != clientPkgName {
+			panic("service and client should be in the same package")
+		}
+	}
+	return &Data{
+		Package:        pkgName,
+		Service:        serviceName,
+		Client:         clientType,
+		ClientID:       clientIDType,
+		ServiceMethods: serviceMethods,
+		ClientMethods:  clientMethods,
+	}
+}
+func getMethods(packages map[string]*ast.Package, name string) (pkgName string, methods []*Method) {
 	for packageName, a := range packages {
 		for _, file := range a.Files {
 			for _, decl := range file.Decls {
@@ -101,7 +165,7 @@ func getData(serviceName string) *Data {
 					if !ok {
 						continue
 					}
-					if typeSpec.Name.Name != serviceName {
+					if typeSpec.Name.Name != name {
 						continue
 					}
 					interfaceType, ok := typeSpec.Type.(*ast.InterfaceType)
@@ -123,33 +187,12 @@ func getData(serviceName string) *Data {
 							})
 						}
 					}
-					return &Data{
-						file:    file.Name.Name,
-						Package: packageName,
-						Service: serviceName,
-						Methods: methods,
-					}
+					return packageName, methods
 				}
 			}
 		}
 	}
-	return nil
-}
-
-func writeFields(bb *bytes.Buffer, fields []*ast.Field) {
-	for i, field := range fields {
-		if i > 0 {
-			bb.WriteString(", ")
-		}
-		for i, name := range field.Names {
-			if i > 0 {
-				bb.WriteString(", ")
-			}
-			bb.WriteString(name.Name)
-		}
-		bb.WriteString(" ")
-		bb.WriteString(types.ExprString(field.Type))
-	}
+	return "", nil
 }
 
 type Method struct {
@@ -165,46 +208,6 @@ func (m *Method) HasReturnedErr() bool {
 	return false
 }
 
-func getMethods() []*Method {
-	f, err := parser.ParseFile(token.NewFileSet(), "proto.go", nil, parser.ParseComments)
-	if err != nil {
-		panic(f)
-	}
-	for _, decl := range f.Decls {
-		genDecl, ok := decl.(*ast.GenDecl)
-		if !ok {
-			continue
-		}
-		for _, spec := range genDecl.Specs {
-			typeSpec, ok := spec.(*ast.TypeSpec)
-			if !ok {
-				continue
-			}
-			name := typeSpec.Name.Name
-			if name != "HandlerInterface" {
-				continue
-			}
-			interfaceType, ok := typeSpec.Type.(*ast.InterfaceType)
-			if !ok {
-				panic("Handler should be interface")
-			}
-			var methods []*Method
-			for _, field := range interfaceType.Methods.List {
-				funcType, ok := field.Type.(*ast.FuncType)
-				if !ok {
-					panic("Handler method should be func")
-				}
-				methods = append(methods, &Method{
-					Name:   field.Names[0].Name,
-					Param:  flattenFields(funcType.Params),
-					Result: flattenFields(funcType.Results),
-				})
-			}
-			return methods
-		}
-	}
-	return nil
-}
 func flattenFields(fl *ast.FieldList) []string {
 	if fl == nil {
 		return nil

@@ -5,19 +5,48 @@ import (
 	"reflect"
 	"unsafe"
 )
-func NewProto(service Proto) (_ Proto, close func()) {
+func NewProto(service Proto) Proto {
 	s := &_genServiceProto{
 		delegate:  service,
+		clients:   make(map[string]*_genClientClient),
 		msgChan:   make(chan any),
 		respChan:  make(chan struct{}, 1),
 		closeChan: make(chan struct{}),
 	}
 	s.initCopy()
 	go s.run()
-	return s, func() { s.closeChan <- struct{}{} }
+	return s
+}
+type _genClientClient struct {
+	service   *_genServiceProto
+	delegate  Client
+	closeChan chan struct{}
+	msgChan   chan any
+}
+func (_x *_genClientClient) Updated(p0 map[int]int) {
+	_x.send(&_genNotifyUpdated{p0: p0})
+}
+func (_x *_genClientClient) send(msg any) {
+	_x.msgChan <- _x.service.copy(msg)
+}
+func (_x *_genClientClient) run() {
+	for {
+		select {
+		case <-_x.closeChan:
+			close(_x.msgChan)
+			close(_x.closeChan)
+			return
+		case receivedMsg := <-_x.msgChan:
+			switch msg := receivedMsg.(type) {
+			case *_genNotifyUpdated:
+				_x.delegate.Updated(msg.p0)
+			}
+		}
+	}
 }
 type _genServiceProto struct {
 	delegate   Proto
+	clients    map[string]*_genClientClient
 	msgChan    chan any
 	respChan   chan struct{}
 	closeChan  chan struct{}
@@ -110,6 +139,36 @@ func (_x *_genServiceProto) recursiveCopy(v reflect.Value, pointers map[uintptr]
 		return reflect.Zero(v.Type())
 	}
 }
+func (_x *_genServiceProto) AddClient(p0 string, p1 Client) {
+	cc := &_genClientClient{
+		service:  _x,
+		delegate: p1,
+		msgChan:  make(chan any),
+	}
+	go cc.run()
+	p1 = cc
+	_x.clients[p0] = cc
+	msg := &_genMsgAddClient{p0: p0, p1: p1}
+	_x.sendAndWait(msg)
+	return
+}
+func (_x *_genServiceProto) RemoveClient(p0 string) {
+	c, ok := _x.clients[p0]
+	if !ok {
+		return
+	}
+	c.closeChan <- struct{}{}
+	delete(_x.clients, p0)
+	msg := &_genMsgRemoveClient{p0: p0}
+	_x.sendAndWait(msg)
+	return
+}
+func (_x *_genServiceProto) Close() {
+	_x.closeChan <- struct{}{}
+	msg := &_genMsgClose{}
+	_x.sendAndWait(msg)
+	return
+}
 func (_x *_genServiceProto) UpdateAndGet(p0 map[int]int) (map[int]int, error) {
 	msg := &_genMsgUpdateAndGet{p0: p0}
 	_x.sendAndWait(msg)
@@ -120,10 +179,22 @@ func (_x *_genServiceProto) sendAndWait(msg any) {
 	<-_x.respChan
 }
 type (
+	_genMsgAddClient struct {
+		p0 string
+		p1 Client
+	}
+	_genMsgRemoveClient struct {
+		p0 string
+	}
+	_genMsgClose struct {
+	}
 	_genMsgUpdateAndGet struct {
 		p0 map[int]int
 		r0 map[int]int
 		r1 error
+	}
+	_genNotifyUpdated struct {
+		p0 map[int]int
 	}
 )
 func (_x *_genServiceProto) run() {
@@ -136,6 +207,12 @@ func (_x *_genServiceProto) run() {
 			return
 		case receivedMsg := <-_x.msgChan:
 			switch msg := receivedMsg.(type) {
+			case *_genMsgAddClient:
+				_x.delegate.AddClient(msg.p0, msg.p1)
+			case *_genMsgRemoveClient:
+				_x.delegate.RemoveClient(msg.p0)
+			case *_genMsgClose:
+				_x.delegate.Close()
 			case *_genMsgUpdateAndGet:
 				_x.wrap(&msg.r1, func() {
 					msg.r0, msg.r1 = _x.delegate.UpdateAndGet(msg.p0)

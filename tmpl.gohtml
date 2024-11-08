@@ -4,21 +4,60 @@ import (
 "fmt"
 "reflect"
 "unsafe"
+{{range .Imports}}
+    "{{.}}"
+{{end}}
 )
-func New{{.Service}}(service {{.Service}}) (_ {{.Service}}, close func()) {
-s:= &_genService{{.Service}}{
+{{$client := print "_genClient" .Client}}
+{{$originalClient:= .Client}}
+{{$service := print "_genService" .Service}}
+func New{{.Service}}(service {{.Service}}) {{.Service}} {
+s:= &{{$service}}{
 delegate: service,
+{{if .ClientID}} clients: make(map[{{.ClientID}}]*{{$client}}), {{end}}
 msgChan: make(chan any),
 respChan: make(chan struct{}, 1),
 closeChan: make(chan struct{}),
 }
 s.initCopy()
 go s.run()
-return s, func(){s.closeChan<-struct{}{}}
+return s
 }
-{{$service := print "_genService" .Service}}
+{{if .ClientID}}
+    type {{$client}} struct {
+    service *{{$service}}
+    delegate {{.Client}}
+    closeChan chan struct{}
+    msgChan chan any
+    }
+    {{range .ClientMethods}}
+        func(_x *{{$client}}) {{.Name}}({{range $i, $x := .Param}}{{if $i}}, {{end}}p{{$i}} {{$x}}{{end}}){
+        _x.send(&_genNotify{{.Name}}{ {{range $i, $x := .Param}}{{if $i}}, {{end}}p{{$i}}: p{{$i}}{{end}}})
+        }
+    {{end}}
+    func (_x *{{$client}}) send(msg any) {
+    _x.msgChan <- _x.service.copy(msg)
+    }
+
+    func (_x *{{$client}}) run() {
+    for {
+    select {
+    case <-_x.closeChan:
+    close(_x.msgChan)
+    close(_x.closeChan)
+    return
+    case receivedMsg := <-_x.msgChan:
+    switch msg := receivedMsg.(type) {
+    {{range .ClientMethods}}case *_genNotify{{.Name}}:
+    _x.delegate.{{.Name}}({{range $i, $x := .Param}}{{if $i}}, {{end}}msg.p{{$i}}{{end}})
+    {{end}}}
+    }
+    }
+    }
+{{end}}
 type {{$service}} struct {
 delegate {{.Service}}
+{{if .ClientID}}clients map[{{.ClientID}}]*{{$client}}{{end}}
 msgChan chan any
 respChan chan struct{}
 closeChan chan struct{}
@@ -114,8 +153,27 @@ default:
 return reflect.Zero(v.Type())
 }
 }
-{{range .Methods}}
+{{range .ServiceMethods}}
     func(_x *{{$service}}) {{.Name}}({{range $i, $x := .Param}}{{if $i}}, {{end}}p{{$i}} {{$x}}{{end}})({{range $i, $x := .Result}}{{if $i}}, {{end}}{{$x}}{{end}}){
+    {{if eq .Name (print "Add" $originalClient)}}
+        cc := &{{$client}}{
+        service: _x,
+        delegate: p1,
+        msgChan: make(chan any),
+        }
+        go cc.run()
+        p1 = cc
+        _x.clients[p0] = cc
+    {{else if eq .Name (print "Remove" $originalClient)}}
+        c, ok := _x.clients[p0]
+        if !ok {
+        return
+        }
+        c.closeChan <- struct{}{}
+        delete(_x.clients, p0)
+    {{else if eq .Name "Close"}}
+        _x.closeChan<-struct{}{}
+    {{end}}
     msg := &_genMsg{{.Name}}{ {{range $i, $x := .Param}}{{if $i}}, {{end}}p{{$i}}: p{{$i}}{{end}}}
     _x.sendAndWait(msg)
     return {{range $i, $x := .Result}}{{if $i}}, {{end}}msg.r{{$i}}{{end}}
@@ -126,10 +184,16 @@ _x.msgChan <- msg
 <-_x.respChan
 }
 type (
-{{range .Methods}}
+{{range .ServiceMethods}}
     _genMsg{{.Name}} struct {
     {{range $i, $x := .Param}}p{{$i}} {{$x}}
     {{end}}{{range $i, $x := .Result}}r{{$i}} {{$x}}
+    {{end}}
+    }
+{{end}}
+{{range .ClientMethods}}
+    _genNotify{{.Name}} struct {
+    {{range $i, $x := .Param}}p{{$i}} {{$x}}
     {{end}}
     }
 {{end}}
@@ -144,7 +208,7 @@ close(_x.closeChan)
 return
 case receivedMsg := <-_x.msgChan:
 switch msg := receivedMsg.(type) {
-{{range .Methods}}case *_genMsg{{.Name}}:
+{{range .ServiceMethods}}case *_genMsg{{.Name}}:
 {{if .HasReturnedErr}} _x.wrap(&msg.r{{Add (len .Result) -1}}, func() { {{end}}
 {{if .Result}}{{range $i, $x := .Result}}{{if $i}}, {{end}}msg.r{{$i}}{{end}} = {{end}} _x.delegate.{{.Name}}({{range $i, $x := .Param}}{{if $i}}, {{end}}msg.p{{$i}}{{end}})
 {{if .Result}}
